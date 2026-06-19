@@ -17,12 +17,10 @@ bun build ./ccpaid.ts --compile --outfile ccpaid
 
 ## Install From GitHub Releases
 
-Download the binary for your platform from the latest release:
+Install the latest release:
 
 ```sh
-curl -L -o ccpaid https://github.com/paid-ai/ccpaid/releases/latest/download/ccpaid-darwin-arm64
-chmod +x ccpaid
-./ccpaid -h
+curl -fsSL https://raw.githubusercontent.com/paid-ai/ccpaid/main/install.sh | sh
 ```
 
 Available release assets:
@@ -30,6 +28,18 @@ Available release assets:
 - `ccpaid-darwin-arm64`
 - `ccpaid-linux-x64`
 - `ccpaid-linux-arm64`
+
+Install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/paid-ai/ccpaid/main/install.sh | CCPAID_VERSION=v0.1.2 sh
+```
+
+Install to a specific directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/paid-ai/ccpaid/main/install.sh | CCPAID_INSTALL_DIR="$HOME/bin" sh
+```
 
 Verify a downloaded binary with the release checksums:
 
