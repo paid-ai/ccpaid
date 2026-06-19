@@ -15,6 +15,30 @@ bun build ./ccpaid.ts --compile --outfile ccpaid
 ./ccpaid -- [claude args...]
 ```
 
+## Install From GitHub Releases
+
+Download the binary for your platform from the latest release:
+
+```sh
+curl -L -o ccpaid https://github.com/paid-ai/ccpaid/releases/latest/download/ccpaid-darwin-arm64
+chmod +x ccpaid
+./ccpaid -h
+```
+
+Available release assets:
+
+- `ccpaid-darwin-arm64`
+- `ccpaid-darwin-x64`
+- `ccpaid-linux-x64`
+- `ccpaid-linux-arm64`
+
+Verify a downloaded binary with the release checksums:
+
+```sh
+curl -L -o checksums.txt https://github.com/paid-ai/ccpaid/releases/latest/download/checksums.txt
+shasum -a 256 -c checksums.txt --ignore-missing
+```
+
 ## Configuration
 
 `PAID_API_KEY` is required. Optional settings:
