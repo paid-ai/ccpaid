@@ -4,12 +4,16 @@
 
 import { PaidClient } from "@paid-ai/paid-node";
 import type { Paid } from "@paid-ai/paid-node";
+import { confirm, input, password, search } from "@inquirer/prompts";
 
 type Customer = Paid.Customer;
 type CustomerTarget = { customerId: string } | { externalCustomerId: string };
 type ProductTarget = { externalProductId: string };
 type UsageCost = Paid.Cost.Usage;
 type CustomMetadata = Record<string, string>;
+type LocalConfig = {
+  paidApiKey?: string;
+};
 
 type Config = {
   apiKey: string;
@@ -69,6 +73,9 @@ const RESERVED_METADATA_FIELDS = new Set([
   "timestamp",
   "costOverride",
 ]);
+
+const CONFIG_DIR_NAME = ".ccpaid";
+const CONFIG_FILE_NAME = "config.json";
 
 class Logger {
   private sink?: { write(input: string): unknown; flush(): unknown };
@@ -203,7 +210,75 @@ class CostQueue {
   }
 }
 
-function parseArgs(argv: string[]): Config {
+function getConfigPath() {
+  const home = process.env.HOME;
+  if (!home) {
+    throw new Error("HOME is not set; cannot locate ~/.ccpaid/config.json.");
+  }
+  return `${home}/${CONFIG_DIR_NAME}/${CONFIG_FILE_NAME}`;
+}
+
+async function readLocalConfig(): Promise<LocalConfig> {
+  const path = getConfigPath();
+  const file = Bun.file(path);
+  if (!(await file.exists())) {
+    return {};
+  }
+
+  const text = await file.text();
+  if (!text.trim()) {
+    return {};
+  }
+
+  const parsed = JSON.parse(text) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    return {};
+  }
+
+  const config = parsed as Record<string, unknown>;
+  return {
+    paidApiKey: typeof config.paidApiKey === "string" ? config.paidApiKey : undefined,
+  };
+}
+
+async function writeLocalConfig(config: LocalConfig): Promise<string> {
+  const path = getConfigPath();
+  const dir = path.slice(0, -`/${CONFIG_FILE_NAME}`.length);
+
+  await ensureDirectory(dir);
+  await Bun.write(path, `${JSON.stringify(stripUndefined(config), null, 2)}\n`);
+  await ensureConfigPermissions(dir, path);
+  return path;
+}
+
+async function ensureDirectory(path: string) {
+  const proc = Bun.spawn(["mkdir", "-p", path], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    throw new Error(`Failed to create ${path}.`);
+  }
+}
+
+async function ensureConfigPermissions(dir: string, file: string) {
+  await chmod(dir, "700");
+  await chmod(file, "600");
+}
+
+async function chmod(path: string, mode: string) {
+  const proc = Bun.spawn(["chmod", mode, path], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    throw new Error(`Failed to set ${mode} permissions on ${path}.`);
+  }
+}
+
+function parseArgs(argv: string[]): Omit<Config, "apiKey"> & { help: boolean; command?: "configure" } {
   const separatorIndex = argv.indexOf("--");
   const ownArgs = separatorIndex === -1 ? argv : argv.slice(0, separatorIndex);
   const claudeArgs = separatorIndex === -1 ? [] : argv.slice(separatorIndex + 1);
@@ -214,6 +289,12 @@ function parseArgs(argv: string[]): Config {
   let logFile = env.CCPAID_LOG_FILE;
   let debug = parseBooleanEnv(env.CCPAID_DEBUG);
   let help = false;
+  let command: "configure" | undefined;
+
+  if (ownArgs[0] === "configure") {
+    command = "configure";
+    ownArgs.shift();
+  }
 
   for (let index = 0; index < ownArgs.length; index++) {
     const arg = ownArgs[index];
@@ -242,23 +323,14 @@ function parseArgs(argv: string[]): Config {
     logFile = defaultLogFile();
   }
 
-  if (help) {
-    printHelp();
-    process.exit(0);
-  }
-
-  const apiKey = env.PAID_API_KEY;
-  if (!apiKey) {
-    throw new Error("PAID_API_KEY is required.");
-  }
-
   return {
-    apiKey,
     externalProductId,
     flushMs,
     debug,
     logFile,
     claudeArgs,
+    help,
+    command,
     querySourceAllow: parseCsvSet(env.CCPAID_QUERY_SOURCE_ALLOW),
     querySourceDeny: parseCsvSet(env.CCPAID_QUERY_SOURCE_DENY),
   };
@@ -269,6 +341,7 @@ function printHelp() {
 
 Usage:
   ccpaid [options] -- [claude args...]
+  ccpaid configure
   bun run ccpaid.ts [options] -- [claude args...]
 
 Options:
@@ -279,20 +352,33 @@ Options:
   -h, --help                 Show this help.
 
 Environment:
-  PAID_API_KEY               Required Paid API key.
+  PAID_API_KEY               Paid API key. Overrides ~/.ccpaid/config.json.
   PAID_EXTERNAL_PRODUCT_ID   Same as --external-product-id.
   CCPAID_FLUSH_MS            Same as --flush-ms.
   CCPAID_DEBUG               Same as --debug when set to 1, true, or yes.
   CCPAID_LOG_FILE            Same as --log-file.
   CCPAID_QUERY_SOURCE_ALLOW  Optional comma-separated query_source allow list.
   CCPAID_QUERY_SOURCE_DENY   Optional comma-separated query_source deny list.
+
+Local config:
+  ccpaid configure stores paidApiKey in ~/.ccpaid/config.json.
 `);
 }
 
 async function main() {
+  let parsedConfig: ReturnType<typeof parseArgs>;
   let config: Config;
   try {
-    config = parseArgs(process.argv.slice(2));
+    parsedConfig = parseArgs(process.argv.slice(2));
+    if (parsedConfig.help) {
+      printHelp();
+      process.exit(0);
+    }
+    if (parsedConfig.command === "configure") {
+      await runConfigure();
+      process.exit(0);
+    }
+    config = await loadConfig(parsedConfig);
   } catch (error) {
     process.stderr.write(`ccpaid: ${formatErrorMessage(error)}\n`);
     process.stderr.write("Run ccpaid -h for usage.\n");
@@ -359,6 +445,66 @@ async function main() {
   process.exit(exitCode ?? 0);
 }
 
+async function loadConfig(parsed: Omit<Config, "apiKey"> & { help: boolean; command?: "configure" }): Promise<Config> {
+  const localConfig = await readLocalConfig();
+  const apiKey = process.env.PAID_API_KEY || localConfig.paidApiKey || (await promptForApiKeyOnFirstRun());
+
+  return {
+    apiKey,
+    externalProductId: parsed.externalProductId,
+    flushMs: parsed.flushMs,
+    debug: parsed.debug,
+    logFile: parsed.logFile,
+    claudeArgs: parsed.claudeArgs,
+    querySourceAllow: parsed.querySourceAllow,
+    querySourceDeny: parsed.querySourceDeny,
+  };
+}
+
+async function runConfigure() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("ccpaid configure requires an interactive terminal.");
+  }
+
+  process.stdout.write("Configure ccpaid\n\n");
+  const paidApiKey = await password({
+    message: "Paid API key:",
+    mask: "*",
+  });
+  if (!paidApiKey) {
+    throw new Error("Paid API key cannot be empty.");
+  }
+
+  const path = await writeLocalConfig({ paidApiKey });
+  process.stdout.write(`Saved config to ${path}\n`);
+}
+
+async function promptForApiKeyOnFirstRun(): Promise<string> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("PAID_API_KEY is required. Run ccpaid configure or set PAID_API_KEY.");
+  }
+
+  process.stdout.write("ccpaid needs a Paid API key for this machine.\n");
+  const paidApiKey = await password({
+    message: "Paid API key:",
+    mask: "*",
+  });
+  if (!paidApiKey) {
+    throw new Error("Paid API key cannot be empty.");
+  }
+
+  const shouldSave = await confirm({
+    message: "Save API key to ~/.ccpaid/config.json?",
+    default: true,
+  });
+  if (shouldSave) {
+    const path = await writeLocalConfig({ paidApiKey });
+    process.stdout.write(`Saved config to ${path}\n`);
+  }
+
+  return paidApiKey;
+}
+
 async function listAllCustomers(client: PaidClient, logger: Logger): Promise<Customer[]> {
   const limit = 100;
   let offset = 0;
@@ -389,119 +535,21 @@ async function listAllCustomers(client: PaidClient, logger: Logger): Promise<Cus
 
 async function selectCustomer(customers: Customer[]): Promise<CustomerTarget> {
   if (process.stdin.isTTY && process.stdout.isTTY) {
-    const customer = await selectCustomerTui(customers);
+    const customer = await search<Customer>({
+      message: "Select Paid customer:",
+      pageSize: 10,
+      source: (term) =>
+        filterCustomers(customers, term ?? "")
+          .slice(0, 50)
+          .map((customer) => ({
+            name: formatCustomer(customer),
+            value: customer,
+          })),
+    });
     return { customerId: customer.id };
   }
 
-  const customer = await selectCustomerNumbered(customers);
-  return { customerId: customer.id };
-}
-
-async function selectCustomerNumbered(customers: Customer[]): Promise<Customer> {
-  const visible = customers.slice(0, 50);
-  process.stdout.write("Select Paid customer:\n");
-  visible.forEach((customer, index) => {
-    process.stdout.write(`${index + 1}. ${formatCustomer(customer)}\n`);
-  });
-  process.stdout.write("> ");
-
-  const input = await readLine();
-  const selectedIndex = Number(input.trim()) - 1;
-  const customer = visible[selectedIndex];
-  if (!customer) {
-    throw new Error("Invalid customer selection.");
-  }
-  return customer;
-}
-
-async function selectCustomerTui(customers: Customer[]): Promise<Customer> {
-  let query = "";
-  let selected = 0;
-  let filtered = filterCustomers(customers, query);
-
-  const stdin = process.stdin;
-
-  return await new Promise<Customer>((resolve, reject) => {
-    const cleanup = () => {
-      stdin.off("data", onData);
-      if (typeof stdin.setRawMode === "function") {
-        stdin.setRawMode(false);
-      }
-      stdin.pause();
-      process.stdout.write("\x1b[?25h\x1b[2J\x1b[H");
-    };
-
-    const finish = (customer: Customer) => {
-      cleanup();
-      resolve(customer);
-    };
-
-    const fail = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-
-    const render = () => {
-      filtered = filterCustomers(customers, query);
-      if (selected >= filtered.length) {
-        selected = Math.max(filtered.length - 1, 0);
-      }
-
-      const windowStart = Math.max(0, Math.min(selected - 9, Math.max(filtered.length - 10, 0)));
-      const rows = filtered.slice(windowStart, windowStart + 10);
-      process.stdout.write("\x1b[?25l\x1b[2J\x1b[H");
-      process.stdout.write("PaidCode customer\n\n");
-      process.stdout.write(`Search: ${query}\n\n`);
-
-      if (rows.length === 0) {
-        process.stdout.write("  No customers match your search.\n");
-      } else {
-        rows.forEach((customer, index) => {
-          const absoluteIndex = windowStart + index;
-          const pointer = absoluteIndex === selected ? ">" : " ";
-          process.stdout.write(`${pointer} ${formatCustomer(customer)}\n`);
-        });
-        process.stdout.write(`\nShowing ${windowStart + 1}-${windowStart + rows.length} of ${filtered.length}\n`);
-      }
-
-      process.stdout.write("\nType to search, arrows to move, Enter to select, Ctrl+C to cancel.\n");
-    };
-
-    const onData = (chunk: Buffer | string) => {
-      const key = chunk.toString("utf8");
-      if (key === "\u0003") {
-        fail(new Error("Cancelled."));
-      } else if (key === "\r" || key === "\n") {
-        const customer = filtered[selected];
-        if (customer) {
-          finish(customer);
-        }
-      } else if (key === "\u001b[A") {
-        selected = Math.max(0, selected - 1);
-        render();
-      } else if (key === "\u001b[B") {
-        selected = Math.min(Math.max(filtered.length - 1, 0), selected + 1);
-        render();
-      } else if (key === "\u007f" || key === "\b") {
-        query = query.slice(0, -1);
-        selected = 0;
-        render();
-      } else if (key === "\u001b") {
-        // Ignore bare escape.
-      } else if (/^[ -~]$/.test(key)) {
-        query += key;
-        selected = 0;
-        render();
-      }
-    };
-
-    if (typeof stdin.setRawMode === "function") {
-      stdin.setRawMode(true);
-    }
-    stdin.resume();
-    stdin.on("data", onData);
-    render();
-  });
+  throw new Error("Customer selection requires an interactive terminal.");
 }
 
 function filterCustomers(customers: Customer[], query: string): Customer[] {
@@ -522,16 +570,22 @@ async function collectCustomMetadata(): Promise<CustomMetadata> {
     return {};
   }
 
-  const shouldAdd = (await promptLine("Add custom metadata? (y/N) ")).trim().toLowerCase();
-  if (shouldAdd !== "y" && shouldAdd !== "yes") {
+  const shouldAdd = await confirm({
+    message: "Add custom metadata?",
+    default: false,
+  });
+  if (!shouldAdd) {
     return {};
   }
 
   const metadata: CustomMetadata = {};
-  process.stdout.write("Enter custom metadata. Leave field name blank when done.\n");
 
   while (true) {
-    const field = (await promptLine("Field name: ")).trim();
+    const field = (
+      await input({
+        message: "Field name (blank to finish):",
+      })
+    ).trim();
     if (!field) {
       break;
     }
@@ -542,7 +596,9 @@ async function collectCustomMetadata(): Promise<CustomMetadata> {
       continue;
     }
 
-    metadata[field] = await promptLine("Value: ");
+    metadata[field] = await input({
+      message: "Value:",
+    });
   }
 
   return metadata;
@@ -931,27 +987,6 @@ function readFlagValue(args: string[], index: number, flag: string): string {
 function formatCustomer(customer: Customer): string {
   const external = customer.externalId ? ` externalId=${customer.externalId}` : "";
   return `${customer.name} (${customer.id}${external})`;
-}
-
-async function promptLine(prompt: string): Promise<string> {
-  process.stdout.write(prompt);
-  return await readLine();
-}
-
-async function readLine(): Promise<string> {
-  return await new Promise((resolve) => {
-    let buffer = "";
-    const onData = (chunk: Buffer | string) => {
-      buffer += chunk.toString();
-      if (buffer.includes("\n")) {
-        process.stdin.off("data", onData);
-        process.stdin.pause();
-        resolve(buffer.split(/\r?\n/, 1)[0] ?? "");
-      }
-    };
-    process.stdin.resume();
-    process.stdin.on("data", onData);
-  });
 }
 
 function defaultLogFile() {
