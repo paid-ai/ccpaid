@@ -28,7 +28,6 @@ chmod +x ccpaid
 Available release assets:
 
 - `ccpaid-darwin-arm64`
-- `ccpaid-darwin-x64`
 - `ccpaid-linux-x64`
 - `ccpaid-linux-arm64`
 
